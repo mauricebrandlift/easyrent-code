@@ -4,9 +4,9 @@
  *
  * Query params:
  * - start=YYYY-MM-DD              (required)
- * - end=YYYY-MM-DD                (required)  // checkout date for night reservations
+ * - end=YYYY-MM-DD                (required)
  * - quantity=1                    (optional, default 1)
- * - resourceIds=1,2,3             (optional: limit search to these resource IDs)
+ * - resourceIds=1,2,3             (optional)
  * - debug=1                       (optional)
  *
  * Env vars:
@@ -52,14 +52,6 @@ function makeRawPreview(obj) {
   return preview;
 }
 
-/**
- * ✅ CORRECT extraction for Planyo resource_search:
- * - Available/bookable resources are in: data.results
- *   data.results is usually an object keyed by arbitrary indexes: { "8": {...}, "18": {...} }
- * - Each result entry contains { id: "<resource_id>", ... }
- *
- * We ONLY return the "id" fields from results.
- */
 function extractAvailableIdsStrict(planyoData) {
   const out = [];
 
@@ -78,14 +70,9 @@ function extractAvailableIdsStrict(planyoData) {
     if (typeof id === "number") out.push(String(id));
   }
 
-  // Deduplicate while keeping order
   return Array.from(new Set(out));
 }
 
-/**
- * reason_not_listed is useful if you pass resourceIds filter.
- * Usually: data.reason_not_listed = { "<resource_id>": "Reason...", ... }
- */
 function extractReasons(planyoData) {
   const reasons =
     planyoData?.data?.reason_not_listed ||
@@ -179,7 +166,9 @@ export default async function handler(req, res) {
       password,
     });
 
-    // Planyo “no results” is often response_code 4
+    const reasonsByResourceId = extractReasons(planyoData);
+
+    // Handle Planyo response_code (e.g. 4 = no results)
     if (planyoData?.response_code && planyoData.response_code !== 0) {
       return json(res, 200, {
         start,
@@ -187,7 +176,7 @@ export default async function handler(req, res) {
         quantity: qty,
         availableResourceIds: [],
         unavailableResourceIds: idsFilter.length ? idsFilter.map(String) : [],
-        reasonsByResourceId: {},
+        reasonsByResourceId,
         error: {
           response_code: planyoData.response_code,
           response_message: planyoData.response_message,
@@ -195,6 +184,7 @@ export default async function handler(req, res) {
         meta: {
           requestedFilterCount: idsFilter.length,
           returnedCount: 0,
+          reasonsCount: Object.keys(reasonsByResourceId).length,
           debug: debugMode ? 1 : 0,
         },
         ...(debugMode
@@ -204,7 +194,6 @@ export default async function handler(req, res) {
     }
 
     const availableResourceIds = extractAvailableIdsStrict(planyoData);
-    const reasonsByResourceId = extractReasons(planyoData);
 
     let unavailableResourceIds = [];
     if (idsFilter.length) {
@@ -222,6 +211,7 @@ export default async function handler(req, res) {
       meta: {
         requestedFilterCount: idsFilter.length,
         returnedCount: availableResourceIds.length,
+        reasonsCount: Object.keys(reasonsByResourceId).length,
         debug: debugMode ? 1 : 0,
       },
       ...(debugMode
