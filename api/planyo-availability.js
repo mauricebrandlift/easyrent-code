@@ -5,7 +5,8 @@
  * Query params:
  * - start=YYYY-MM-DD
  * - end=YYYY-MM-DD
- * - resourceIds=123,456,789   (optioneel maar aanbevolen; zo filter je alleen op je CMS IDs)
+ * - resourceIds=123,456,789   (aanbevolen: alleen IDs van jouw CMS cards)
+ * - debug=1                   (optioneel: voegt debugResults toe in response)
  *
  * Env vars (Vercel Project Settings):
  * - PLANYO_API_BASE     (default: https://www.planyo.com/rest/)
@@ -14,7 +15,13 @@
  * - PLANYO_API_PASSWORD (optioneel, als jouw setup dat vereist)
  *
  * Output:
- * { start, end, availableResourceIds: ["123","456"], unavailableResourceIds: ["789"] }
+ * {
+ *   start, end,
+ *   availableResourceIds: ["123","456"],
+ *   unavailableResourceIds: ["789"],
+ *   meta: {...},
+ *   debugResults?: [...]
+ * }
  */
 
 function json(res, status, data) {
@@ -43,14 +50,47 @@ function parseIds(csv) {
   if (!csv) return [];
   return String(csv)
     .split(",")
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
 }
 
-async function callPlanyoGetResourceUsage({ baseUrl, apiKey, start, end, resourceId, username, password }) {
+function safeKeys(obj) {
+  if (!obj || typeof obj !== "object") return [];
+  return Object.keys(obj);
+}
+
+function makeRawPreview(planyoData) {
+  // We willen geen megagrote response. Dit is een "compacte preview".
+  // Probeert de meest waarschijnlijke plekken te pakken waar usage info in zit.
+  const preview =
+    planyoData?.data ??
+    planyoData?.result ??
+    planyoData;
+
+  // Als preview een array is of heel groot object, geven we alleen eerste lagen terug.
+  if (Array.isArray(preview)) {
+    return preview.slice(0, 3);
+  }
+  if (preview && typeof preview === "object") {
+    const out = {};
+    const keys = Object.keys(preview).slice(0, 25);
+    for (const k of keys) out[k] = preview[k];
+    return out;
+  }
+  return preview;
+}
+
+async function callPlanyoGetResourceUsage({
+  baseUrl,
+  apiKey,
+  start,
+  end,
+  resourceId,
+  username,
+  password,
+}) {
   // Planyo REST endpoint variations bestaan; deze is de meest gangbare:
   // https://www.planyo.com/rest/?method=get_resource_usage&api_key=...&resource_id=...&from=...&to=...
-  // Als jouw account andere param-namen vereist, passen we dit straks aan zodra je 1 voorbeeldresponse deelt.
 
   const url = new URL(baseUrl || "https://www.planyo.com/rest/");
   url.searchParams.set("method", "get_resource_usage");
@@ -66,7 +106,9 @@ async function callPlanyoGetResourceUsage({ baseUrl, apiKey, start, end, resourc
   const resp = await fetch(url.toString(), { method: "GET" });
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    throw new Error(`Planyo HTTP ${resp.status} for resource ${resourceId}. Body: ${text.slice(0, 300)}`);
+    throw new Error(
+      `Planyo HTTP ${resp.status} for resource ${resourceId}. Body: ${text.slice(0, 300)}`
+    );
   }
 
   // Planyo kan JSON teruggeven; soms is het "text/json"
@@ -84,12 +126,12 @@ function extractBusyRanges(planyoData) {
    * Vaak zit bezetting in een array met items met from/to of start/end.
    *
    * We proberen meerdere vormen “best effort” te ondersteunen.
-   * Als jouw response anders is, dan hoef je maar 1 sample te sturen en dan maken we dit exact.
+   * Zodra jij 1 debug response deelt waar boekingen in staan,
+   * maken we dit exact voor jouw response-structuur.
    */
 
   const busy = [];
 
-  // 1) Veelvoorkomend: { data: { periods: [{from:"YYYY-MM-DD", to:"YYYY-MM-DD"}] } }
   const candidates = [
     planyoData?.data?.periods,
     planyoData?.periods,
@@ -98,7 +140,9 @@ function extractBusyRanges(planyoData) {
     planyoData?.data?.bookings,
     planyoData?.bookings,
     planyoData?.result?.periods,
-  ].find(arr => Array.isArray(arr));
+    planyoData?.result?.usage,
+    planyoData?.result?.bookings,
+  ].find((arr) => Array.isArray(arr));
 
   if (!candidates) return busy;
 
@@ -141,7 +185,8 @@ export default async function handler(req, res) {
 
     if (!apiKey) return json(res, 500, { error: "Missing env var: PLANYO_API_KEY" });
 
-    const { start, end, resourceIds } = req.query;
+    const { start, end, resourceIds, debug } = req.query;
+    const debugMode = String(debug || "").toLowerCase() === "1";
 
     if (!isValidISODate(start) || !isValidISODate(end)) {
       return json(res, 400, { error: "Invalid or missing start/end. Use YYYY-MM-DD." });
@@ -190,11 +235,28 @@ export default async function handler(req, res) {
         }
       }
 
-      return { id: String(id), isAvailable };
+      if (!debugMode) {
+        return { id: String(id), isAvailable };
+      }
+
+      // Debug info: compact maar informatief
+      return {
+        id: String(id),
+        isAvailable,
+        debugInfo: {
+          topLevelKeys: safeKeys(planyoData),
+          dataKeys: safeKeys(planyoData?.data),
+          resultKeys: safeKeys(planyoData?.result),
+          busyRanges,
+          rawPreview: makeRawPreview(planyoData),
+        },
+      };
     });
 
-    const availableResourceIds = results.filter(r => r.isAvailable).map(r => r.id);
-    const unavailableResourceIds = results.filter(r => !r.isAvailable).map(r => r.id);
+    const availableResourceIds = results.filter((r) => r.isAvailable).map((r) => r.id);
+    const unavailableResourceIds = results.filter((r) => !r.isAvailable).map((r) => r.id);
+
+    const debugResults = debugMode ? results : undefined;
 
     return json(res, 200, {
       start,
@@ -204,7 +266,9 @@ export default async function handler(req, res) {
       meta: {
         checked: ids.length,
         concurrency: CONCURRENCY,
+        debug: debugMode ? 1 : 0,
       },
+      ...(debugMode ? { debugResults } : {}),
     });
   } catch (err) {
     return json(res, 500, { error: err?.message || "Unknown error" });
