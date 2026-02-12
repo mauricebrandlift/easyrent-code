@@ -2,26 +2,18 @@
  * Vercel Serverless Function (Node)
  * Endpoint: /api/planyo-available
  *
- * Doel:
- * - Alleen start + end => lijst beschikbare Planyo resource IDs terug
- * - Optioneel: beperken tot een set resourceIds (bijv. uit Webflow CMS) via ppp_resfilter
- *
  * Query params:
  * - start=YYYY-MM-DD              (required)
- * - end=YYYY-MM-DD                (required)
+ * - end=YYYY-MM-DD                (required)  // checkout date for night reservations
  * - quantity=1                    (optional, default 1)
- * - resourceIds=1,2,3             (optional: beperkt search tot deze resource IDs)
- * - debug=1                       (optional: geeft extra debug info terug)
- *
- * Belangrijke Planyo regels:
- * - resource_search vereist start_time, end_time, quantity. :contentReference[oaicite:2]{index=2}
- * - Voor accomodaties / night reservations: end_time = vertrekdatum zonder tijd. :contentReference[oaicite:3]{index=3}
+ * - resourceIds=1,2,3             (optional: limit search to these resource IDs)
+ * - debug=1                       (optional)
  *
  * Env vars:
  * - PLANYO_API_BASE (default: https://www.planyo.com/rest/)
  * - PLANYO_API_KEY
- * - PLANYO_API_USERNAME (optioneel)
- * - PLANYO_API_PASSWORD (optioneel)
+ * - PLANYO_API_USERNAME (optional)
+ * - PLANYO_API_PASSWORD (optional)
  */
 
 function json(res, status, data) {
@@ -61,79 +53,52 @@ function makeRawPreview(obj) {
 }
 
 /**
- * Extract beschikbare resource IDs uit resource_search response.
- * Planyo output kan per account/config wat verschillen.
- * We doen daarom "best effort" en hebben debug=1 om de exacte structuur te zien.
+ * ✅ CORRECT extraction for Planyo resource_search:
+ * - Available/bookable resources are in: data.results
+ *   data.results is usually an object keyed by arbitrary indexes: { "8": {...}, "18": {...} }
+ * - Each result entry contains { id: "<resource_id>", ... }
+ *
+ * We ONLY return the "id" fields from results.
  */
-function extractAvailableIds(planyoData) {
-  const ids = new Set();
+function extractAvailableIdsStrict(planyoData) {
+  const out = [];
 
-  // Most likely containers:
-  const containers = [
-    planyoData?.data,
-    planyoData?.result,
-    planyoData,
-  ].filter(Boolean);
+  const resultsObj =
+    planyoData?.data?.results ||
+    planyoData?.result?.results ||
+    planyoData?.results ||
+    null;
 
-  // Helper: try to read id from common shapes
-  const pushId = (v) => {
-    if (v == null) return;
-    if (typeof v === "number") ids.add(String(v));
-    if (typeof v === "string" && /^\d+$/.test(v)) ids.add(v);
-  };
+  if (!resultsObj || typeof resultsObj !== "object") return out;
 
-  // Try common arrays:
-  // e.g. data.results / data.resources / results / resources
-  for (const c of containers) {
-    const candidates = [
-      c?.results,
-      c?.resources,
-      c?.data?.results,
-      c?.data?.resources,
-    ].filter(Array.isArray);
-
-    for (const arr of candidates) {
-      for (const item of arr) {
-        // Common keys: resource_id, id
-        pushId(item?.resource_id);
-        pushId(item?.id);
-
-        // Sometimes nested:
-        pushId(item?.resource?.id);
-        pushId(item?.resource?.resource_id);
-      }
-    }
+  for (const k of Object.keys(resultsObj)) {
+    const item = resultsObj[k];
+    const id = item?.id || item?.resource_id;
+    if (typeof id === "string" && /^\d+$/.test(id)) out.push(id);
+    if (typeof id === "number") out.push(String(id));
   }
 
-  // If nothing found, do a shallow scan of objects for numeric keys / resource_id fields
-  if (ids.size === 0) {
-    const stack = [planyoData];
-    const seen = new Set();
-    while (stack.length) {
-      const cur = stack.pop();
-      if (!cur || typeof cur !== "object") continue;
-      if (seen.has(cur)) continue;
-      seen.add(cur);
+  // Deduplicate while keeping order
+  return Array.from(new Set(out));
+}
 
-      if (Array.isArray(cur)) {
-        for (const x of cur) stack.push(x);
-        continue;
-      }
+/**
+ * reason_not_listed is useful if you pass resourceIds filter.
+ * Usually: data.reason_not_listed = { "<resource_id>": "Reason...", ... }
+ */
+function extractReasons(planyoData) {
+  const reasons =
+    planyoData?.data?.reason_not_listed ||
+    planyoData?.result?.reason_not_listed ||
+    planyoData?.reason_not_listed ||
+    null;
 
-      // If object has a resource_id-like field
-      pushId(cur.resource_id);
-      pushId(cur.id);
-
-      for (const k of Object.keys(cur)) {
-        const v = cur[k];
-        // Sometimes results are keyed by resource_id
-        if (/^\d+$/.test(k)) pushId(k);
-        if (v && typeof v === "object") stack.push(v);
-      }
-    }
+  if (!reasons || typeof reasons !== "object") return {};
+  const out = {};
+  for (const rid of Object.keys(reasons)) {
+    out[String(rid)] = String(reasons[rid]);
   }
-
-  return Array.from(ids);
+  return out;
 }
 
 async function callPlanyoResourceSearch({
@@ -150,17 +115,14 @@ async function callPlanyoResourceSearch({
   url.searchParams.set("method", "resource_search");
   url.searchParams.set("api_key", apiKey);
 
-  // required inputs per docs :contentReference[oaicite:4]{index=4}
   url.searchParams.set("start_time", start);
   url.searchParams.set("end_time", end);
   url.searchParams.set("quantity", String(quantity));
 
-  // Optional: limit searched resources by comma-separated IDs (ppp_resfilter) :contentReference[oaicite:5]{index=5}
   if (resourceIds && resourceIds.length) {
     url.searchParams.set("ppp_resfilter", resourceIds.join(","));
   }
 
-  // Optional auth (some accounts/configs)
   if (username) url.searchParams.set("username", username);
   if (password) url.searchParams.set("password", password);
 
@@ -204,7 +166,7 @@ export default async function handler(req, res) {
       return json(res, 400, { error: "Invalid quantity. Use a positive number." });
     }
 
-    const ids = parseIds(resourceIds);
+    const idsFilter = parseIds(resourceIds);
 
     const planyoData = await callPlanyoResourceSearch({
       baseUrl,
@@ -212,54 +174,58 @@ export default async function handler(req, res) {
       start,
       end,
       quantity: qty,
-      resourceIds: ids,
+      resourceIds: idsFilter,
       username,
       password,
     });
 
-    // Planyo error format (common): response_code + response_message
+    // Planyo “no results” is often response_code 4
     if (planyoData?.response_code && planyoData.response_code !== 0) {
       return json(res, 200, {
         start,
         end,
         quantity: qty,
         availableResourceIds: [],
+        unavailableResourceIds: idsFilter.length ? idsFilter.map(String) : [],
+        reasonsByResourceId: {},
         error: {
           response_code: planyoData.response_code,
           response_message: planyoData.response_message,
         },
+        meta: {
+          requestedFilterCount: idsFilter.length,
+          returnedCount: 0,
+          debug: debugMode ? 1 : 0,
+        },
         ...(debugMode
-          ? {
-              debug: {
-                topLevelKeys: safeKeys(planyoData),
-                rawPreview: makeRawPreview(planyoData),
-              },
-            }
+          ? { debug: { topLevelKeys: safeKeys(planyoData), rawPreview: makeRawPreview(planyoData) } }
           : {}),
       });
     }
 
-    const availableResourceIds = extractAvailableIds(planyoData);
+    const availableResourceIds = extractAvailableIdsStrict(planyoData);
+    const reasonsByResourceId = extractReasons(planyoData);
+
+    let unavailableResourceIds = [];
+    if (idsFilter.length) {
+      const availSet = new Set(availableResourceIds.map(String));
+      unavailableResourceIds = idsFilter.map(String).filter((id) => !availSet.has(id));
+    }
 
     return json(res, 200, {
       start,
       end,
       quantity: qty,
-      // Als je resourceIds meegaf, zijn dit de "available binnen die set".
-      // Als je niets meegaf, zijn dit alle available resources die Planyo teruggeeft.
       availableResourceIds,
+      unavailableResourceIds,
+      reasonsByResourceId,
       meta: {
-        requestedFilterCount: ids.length,
+        requestedFilterCount: idsFilter.length,
         returnedCount: availableResourceIds.length,
         debug: debugMode ? 1 : 0,
       },
       ...(debugMode
-        ? {
-            debug: {
-              topLevelKeys: safeKeys(planyoData),
-              rawPreview: makeRawPreview(planyoData),
-            },
-          }
+        ? { debug: { topLevelKeys: safeKeys(planyoData), rawPreview: makeRawPreview(planyoData) } }
         : {}),
     });
   } catch (err) {
