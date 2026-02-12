@@ -8,25 +8,11 @@
  * - resourceIds=248567,143577,...
  * - debug=1  (optioneel)
  *
- * Env vars (Vercel Project Settings):
+ * Env vars:
  * - PLANYO_API_BASE     (default: https://www.planyo.com/rest/)
- * - PLANYO_API_KEY      (jouw Planyo API key)
+ * - PLANYO_API_KEY
  * - PLANYO_API_USERNAME (optioneel)
  * - PLANYO_API_PASSWORD (optioneel)
- *
- * Output:
- * {
- *   start, end,
- *   availableResourceIds: [...],
- *   unavailableResourceIds: [...],
- *   meta: {...},
- *   debugResults?: [...]
- * }
- *
- * Planyo get_resource_usage:
- * - start_date (required)
- * - end_date (required)
- * - separate_periods (required)
  */
 
 function json(res, status, data) {
@@ -73,7 +59,6 @@ function makeRawPreview(planyoData) {
 }
 
 function isUnixSeconds(n) {
-  // 10 digits ~ seconds since epoch
   return typeof n === "number" && n > 1000000000 && n < 99999999999;
 }
 
@@ -94,11 +79,8 @@ async function callPlanyoGetResourceUsage({
   url.searchParams.set("method", "get_resource_usage");
   url.searchParams.set("api_key", apiKey);
   url.searchParams.set("resource_id", String(resourceId));
-
   url.searchParams.set("start_date", start);
   url.searchParams.set("end_date", end);
-
-  // Required by Planyo
   url.searchParams.set("separate_periods", "true");
 
   if (username) url.searchParams.set("username", username);
@@ -121,19 +103,9 @@ async function callPlanyoGetResourceUsage({
 }
 
 function extractBusyRangesForResource(planyoData, resourceId) {
-  /**
-   * We support the structure we just saw:
-   * data.usage[resourceId] = { "0": {from:<unix>, to:<unix>, q:1}, ... }
-   *
-   * But we also keep a few fallbacks for other setups.
-   *
-   * Output format: [{ start: Date, end: Date }]
-   */
-
   const busy = [];
   const rid = String(resourceId);
 
-  // ✅ Primary: data.usage[rid][...].from/to (UNIX seconds)
   const usageByRid = planyoData?.data?.usage?.[rid];
   if (usageByRid && typeof usageByRid === "object") {
     for (const key of Object.keys(usageByRid)) {
@@ -142,15 +114,13 @@ function extractBusyRangesForResource(planyoData, resourceId) {
       const to = item?.to;
 
       if (isUnixSeconds(from) && isUnixSeconds(to)) {
-        // Planyo "to" is end-of-day inclusive in seconds in your sample (23:59:59)
-        // We'll convert directly; overlap check works fine.
         busy.push({ start: unixSecondsToDateUTC(from), end: unixSecondsToDateUTC(to) });
       }
     }
     return busy;
   }
 
-  // --- Fallbacks (if your account ever returns other shapes) ---
+  // Fallbacks (niet nodig in jouw case, maar safe)
   const candidates = [
     planyoData?.data?.periods,
     planyoData?.periods,
@@ -231,6 +201,8 @@ export default async function handler(req, res) {
     const checkRange = { start: startDate, end: endDate };
     const CONCURRENCY = 6;
 
+    const errorsByResourceId = {};
+
     const results = await mapWithConcurrency(ids, CONCURRENCY, async (id) => {
       const planyoData = await callPlanyoGetResourceUsage({
         baseUrl,
@@ -242,12 +214,18 @@ export default async function handler(req, res) {
         password,
       });
 
-      // Planyo errors komen vaak als {response_code, response_message}
+      // ✅ Belangrijk: bij Planyo error -> markeer NIET als available
       if (planyoData?.response_code && planyoData?.response_code !== 0) {
-        const base = { id: String(id), isAvailable: true };
-        if (!debugMode) return base;
+        errorsByResourceId[String(id)] = {
+          response_code: planyoData.response_code,
+          response_message: planyoData.response_message,
+        };
+
+        if (!debugMode) return { id: String(id), isAvailable: false };
+
         return {
-          ...base,
+          id: String(id),
+          isAvailable: false,
           debugInfo: {
             error: {
               response_code: planyoData.response_code,
@@ -264,7 +242,6 @@ export default async function handler(req, res) {
 
       let isAvailable = true;
       for (const b of busyRanges) {
-        // Busy range is [b.start, b.end]; our check is [startDate, endDate)
         if (rangesOverlap(checkRange.start, checkRange.end, b.start, b.end)) {
           isAvailable = false;
           break;
@@ -298,6 +275,7 @@ export default async function handler(req, res) {
       end,
       availableResourceIds,
       unavailableResourceIds,
+      errorsByResourceId,
       meta: {
         checked: ids.length,
         concurrency: CONCURRENCY,
