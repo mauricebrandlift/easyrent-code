@@ -11,8 +11,8 @@
  * Env vars (Vercel Project Settings):
  * - PLANYO_API_BASE     (default: https://www.planyo.com/rest/)
  * - PLANYO_API_KEY      (jouw Planyo API key)
- * - PLANYO_API_USERNAME (optioneel, als jouw setup dat vereist)
- * - PLANYO_API_PASSWORD (optioneel, als jouw setup dat vereist)
+ * - PLANYO_API_USERNAME (optioneel)
+ * - PLANYO_API_PASSWORD (optioneel)
  *
  * Output:
  * {
@@ -23,13 +23,10 @@
  *   debugResults?: [...]
  * }
  *
- * Planyo doc: get_resource_usage requires:
+ * Planyo get_resource_usage:
  * - start_date (required)
  * - end_date (required)
  * - separate_periods (required)
- * - resource_id (optional)
- * - method=get_resource_usage (required)
- * - api_key (required)
  */
 
 function json(res, status, data) {
@@ -75,6 +72,15 @@ function makeRawPreview(planyoData) {
   return preview;
 }
 
+function isUnixSeconds(n) {
+  // 10 digits ~ seconds since epoch
+  return typeof n === "number" && n > 1000000000 && n < 99999999999;
+}
+
+function unixSecondsToDateUTC(sec) {
+  return new Date(sec * 1000);
+}
+
 async function callPlanyoGetResourceUsage({
   baseUrl,
   apiKey,
@@ -84,12 +90,6 @@ async function callPlanyoGetResourceUsage({
   username,
   password,
 }) {
-  // ✅ Correct parameter names for get_resource_usage:
-  // start_date, end_date, separate_periods (required)
-  // resource_id (optional)
-  // method, api_key (required)
-  // Docs: https://www.planyo.com/api.php?topic=get_resource_usage
-
   const url = new URL(baseUrl || "https://www.planyo.com/rest/");
   url.searchParams.set("method", "get_resource_usage");
   url.searchParams.set("api_key", apiKey);
@@ -98,10 +98,9 @@ async function callPlanyoGetResourceUsage({
   url.searchParams.set("start_date", start);
   url.searchParams.set("end_date", end);
 
-  // required by Planyo; we want grouped ranges (smaller output)
+  // Required by Planyo
   url.searchParams.set("separate_periods", "true");
 
-  // Sommige setups gebruiken extra auth:
   if (username) url.searchParams.set("username", username);
   if (password) url.searchParams.set("password", password);
 
@@ -121,37 +120,61 @@ async function callPlanyoGetResourceUsage({
   return data;
 }
 
-function extractBusyRanges(planyoData) {
+function extractBusyRangesForResource(planyoData, resourceId) {
   /**
-   * Na fix van start_date/end_date/separate_periods zou Planyo nu usage moeten teruggeven.
-   * De exacte structuur kan verschillen; we ondersteunen meerdere varianten.
+   * We support the structure we just saw:
+   * data.usage[resourceId] = { "0": {from:<unix>, to:<unix>, q:1}, ... }
+   *
+   * But we also keep a few fallbacks for other setups.
+   *
+   * Output format: [{ start: Date, end: Date }]
    */
 
   const busy = [];
+  const rid = String(resourceId);
 
+  // ✅ Primary: data.usage[rid][...].from/to (UNIX seconds)
+  const usageByRid = planyoData?.data?.usage?.[rid];
+  if (usageByRid && typeof usageByRid === "object") {
+    for (const key of Object.keys(usageByRid)) {
+      const item = usageByRid[key];
+      const from = item?.from;
+      const to = item?.to;
+
+      if (isUnixSeconds(from) && isUnixSeconds(to)) {
+        // Planyo "to" is end-of-day inclusive in seconds in your sample (23:59:59)
+        // We'll convert directly; overlap check works fine.
+        busy.push({ start: unixSecondsToDateUTC(from), end: unixSecondsToDateUTC(to) });
+      }
+    }
+    return busy;
+  }
+
+  // --- Fallbacks (if your account ever returns other shapes) ---
   const candidates = [
     planyoData?.data?.periods,
     planyoData?.periods,
-    planyoData?.data?.usage,
-    planyoData?.usage,
     planyoData?.data?.bookings,
     planyoData?.bookings,
     planyoData?.result?.periods,
-    planyoData?.result?.usage,
-    planyoData?.result?.bookings,
-    planyoData?.data, // soms zit het direct hier in geneste arrays
-    planyoData?.result,
   ].find((arr) => Array.isArray(arr));
 
   if (!candidates) return busy;
 
   for (const item of candidates) {
-    // meest waarschijnlijke velden:
-    const from = item?.from || item?.start || item?.date_from || item?.begin || item?.start_date;
-    const to = item?.to || item?.end || item?.date_to || item?.finish || item?.end_date;
+    const fromIso =
+      item?.from || item?.start || item?.date_from || item?.begin || item?.start_date;
+    const toIso = item?.to || item?.end || item?.date_to || item?.finish || item?.end_date;
 
-    if (isValidISODate(from) && isValidISODate(to)) {
-      busy.push({ from, to });
+    if (isValidISODate(fromIso) && isValidISODate(toIso)) {
+      busy.push({ start: toDateUTC(fromIso), end: toDateUTC(toIso) });
+      continue;
+    }
+
+    const from = item?.from;
+    const to = item?.to;
+    if (isUnixSeconds(from) && isUnixSeconds(to)) {
+      busy.push({ start: unixSecondsToDateUTC(from), end: unixSecondsToDateUTC(to) });
     }
   }
 
@@ -201,8 +224,7 @@ export default async function handler(req, res) {
     const ids = parseIds(resourceIds);
     if (ids.length === 0) {
       return json(res, 400, {
-        error:
-          "Missing resourceIds. Provide comma-separated resource IDs from your Webflow CMS (planyo_resource_id).",
+        error: "Missing resourceIds. Provide comma-separated resource IDs from Webflow CMS.",
       });
     }
 
@@ -222,7 +244,6 @@ export default async function handler(req, res) {
 
       // Planyo errors komen vaak als {response_code, response_message}
       if (planyoData?.response_code && planyoData?.response_code !== 0) {
-        // We behandelen dit als "unknown" -> beschikbaar (maar met debug zichtbaar)
         const base = { id: String(id), isAvailable: true };
         if (!debugMode) return base;
         return {
@@ -234,18 +255,17 @@ export default async function handler(req, res) {
             },
             topLevelKeys: safeKeys(planyoData),
             rawPreview: makeRawPreview(planyoData),
-            busyRanges: [],
+            busyCount: 0,
           },
         };
       }
 
-      const busyRanges = extractBusyRanges(planyoData);
+      const busyRanges = extractBusyRangesForResource(planyoData, id);
 
       let isAvailable = true;
       for (const b of busyRanges) {
-        const bStart = toDateUTC(b.from);
-        const bEnd = toDateUTC(b.to);
-        if (rangesOverlap(checkRange.start, checkRange.end, bStart, bEnd)) {
+        // Busy range is [b.start, b.end]; our check is [startDate, endDate)
+        if (rangesOverlap(checkRange.start, checkRange.end, b.start, b.end)) {
           isAvailable = false;
           break;
         }
@@ -259,8 +279,12 @@ export default async function handler(req, res) {
         debugInfo: {
           topLevelKeys: safeKeys(planyoData),
           dataKeys: safeKeys(planyoData?.data),
-          resultKeys: safeKeys(planyoData?.result),
-          busyRanges,
+          usageKeys: safeKeys(planyoData?.data?.usage),
+          busyCount: busyRanges.length,
+          busySample: busyRanges.slice(0, 5).map((r) => ({
+            start: r.start.toISOString(),
+            end: r.end.toISOString(),
+          })),
           rawPreview: makeRawPreview(planyoData),
         },
       };
