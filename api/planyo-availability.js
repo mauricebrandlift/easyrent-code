@@ -1,15 +1,24 @@
 /**
  * Vercel Serverless Function (Node)
- * Endpoint: /api/planyo-availability
+ * Endpoint: /api/planyo-available
+ *
+ * Doel:
+ * - Alleen start + end => lijst beschikbare Planyo resource IDs terug
+ * - Optioneel: beperken tot een set resourceIds (bijv. uit Webflow CMS) via ppp_resfilter
  *
  * Query params:
- * - start=YYYY-MM-DD
- * - end=YYYY-MM-DD
- * - resourceIds=248567,143577,...
- * - debug=1  (optioneel)
+ * - start=YYYY-MM-DD              (required)
+ * - end=YYYY-MM-DD                (required)
+ * - quantity=1                    (optional, default 1)
+ * - resourceIds=1,2,3             (optional: beperkt search tot deze resource IDs)
+ * - debug=1                       (optional: geeft extra debug info terug)
+ *
+ * Belangrijke Planyo regels:
+ * - resource_search vereist start_time, end_time, quantity. :contentReference[oaicite:2]{index=2}
+ * - Voor accomodaties / night reservations: end_time = vertrekdatum zonder tijd. :contentReference[oaicite:3]{index=3}
  *
  * Env vars:
- * - PLANYO_API_BASE     (default: https://www.planyo.com/rest/)
+ * - PLANYO_API_BASE (default: https://www.planyo.com/rest/)
  * - PLANYO_API_KEY
  * - PLANYO_API_USERNAME (optioneel)
  * - PLANYO_API_PASSWORD (optioneel)
@@ -26,14 +35,6 @@ function isValidISODate(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
-function toDateUTC(iso) {
-  return new Date(`${iso}T00:00:00.000Z`);
-}
-
-function rangesOverlap(aStart, aEnd, bStart, bEnd) {
-  return aStart < bEnd && bStart < aEnd;
-}
-
 function parseIds(csv) {
   if (!csv) return [];
   return String(csv)
@@ -47,51 +48,126 @@ function safeKeys(obj) {
   return Object.keys(obj);
 }
 
-function makeRawPreview(planyoData) {
-  const preview = planyoData?.data ?? planyoData?.result ?? planyoData;
-  if (Array.isArray(preview)) return preview.slice(0, 3);
+function makeRawPreview(obj) {
+  if (!obj) return obj;
+  const preview = obj?.data ?? obj?.result ?? obj;
+  if (Array.isArray(preview)) return preview.slice(0, 5);
   if (preview && typeof preview === "object") {
     const out = {};
-    for (const k of Object.keys(preview).slice(0, 25)) out[k] = preview[k];
+    for (const k of Object.keys(preview).slice(0, 35)) out[k] = preview[k];
     return out;
   }
   return preview;
 }
 
-function isUnixSeconds(n) {
-  return typeof n === "number" && n > 1000000000 && n < 99999999999;
+/**
+ * Extract beschikbare resource IDs uit resource_search response.
+ * Planyo output kan per account/config wat verschillen.
+ * We doen daarom "best effort" en hebben debug=1 om de exacte structuur te zien.
+ */
+function extractAvailableIds(planyoData) {
+  const ids = new Set();
+
+  // Most likely containers:
+  const containers = [
+    planyoData?.data,
+    planyoData?.result,
+    planyoData,
+  ].filter(Boolean);
+
+  // Helper: try to read id from common shapes
+  const pushId = (v) => {
+    if (v == null) return;
+    if (typeof v === "number") ids.add(String(v));
+    if (typeof v === "string" && /^\d+$/.test(v)) ids.add(v);
+  };
+
+  // Try common arrays:
+  // e.g. data.results / data.resources / results / resources
+  for (const c of containers) {
+    const candidates = [
+      c?.results,
+      c?.resources,
+      c?.data?.results,
+      c?.data?.resources,
+    ].filter(Array.isArray);
+
+    for (const arr of candidates) {
+      for (const item of arr) {
+        // Common keys: resource_id, id
+        pushId(item?.resource_id);
+        pushId(item?.id);
+
+        // Sometimes nested:
+        pushId(item?.resource?.id);
+        pushId(item?.resource?.resource_id);
+      }
+    }
+  }
+
+  // If nothing found, do a shallow scan of objects for numeric keys / resource_id fields
+  if (ids.size === 0) {
+    const stack = [planyoData];
+    const seen = new Set();
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || typeof cur !== "object") continue;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+
+      if (Array.isArray(cur)) {
+        for (const x of cur) stack.push(x);
+        continue;
+      }
+
+      // If object has a resource_id-like field
+      pushId(cur.resource_id);
+      pushId(cur.id);
+
+      for (const k of Object.keys(cur)) {
+        const v = cur[k];
+        // Sometimes results are keyed by resource_id
+        if (/^\d+$/.test(k)) pushId(k);
+        if (v && typeof v === "object") stack.push(v);
+      }
+    }
+  }
+
+  return Array.from(ids);
 }
 
-function unixSecondsToDateUTC(sec) {
-  return new Date(sec * 1000);
-}
-
-async function callPlanyoGetResourceUsage({
+async function callPlanyoResourceSearch({
   baseUrl,
   apiKey,
   start,
   end,
-  resourceId,
+  quantity,
+  resourceIds,
   username,
   password,
 }) {
   const url = new URL(baseUrl || "https://www.planyo.com/rest/");
-  url.searchParams.set("method", "get_resource_usage");
+  url.searchParams.set("method", "resource_search");
   url.searchParams.set("api_key", apiKey);
-  url.searchParams.set("resource_id", String(resourceId));
-  url.searchParams.set("start_date", start);
-  url.searchParams.set("end_date", end);
-  url.searchParams.set("separate_periods", "true");
 
+  // required inputs per docs :contentReference[oaicite:4]{index=4}
+  url.searchParams.set("start_time", start);
+  url.searchParams.set("end_time", end);
+  url.searchParams.set("quantity", String(quantity));
+
+  // Optional: limit searched resources by comma-separated IDs (ppp_resfilter) :contentReference[oaicite:5]{index=5}
+  if (resourceIds && resourceIds.length) {
+    url.searchParams.set("ppp_resfilter", resourceIds.join(","));
+  }
+
+  // Optional auth (some accounts/configs)
   if (username) url.searchParams.set("username", username);
   if (password) url.searchParams.set("password", password);
 
   const resp = await fetch(url.toString(), { method: "GET" });
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    throw new Error(
-      `Planyo HTTP ${resp.status} for resource ${resourceId}. Body: ${text.slice(0, 300)}`
-    );
+    throw new Error(`Planyo HTTP ${resp.status}. Body: ${text.slice(0, 300)}`);
   }
 
   const data = await resp.json().catch(async () => {
@@ -100,68 +176,6 @@ async function callPlanyoGetResourceUsage({
   });
 
   return data;
-}
-
-function extractBusyRangesForResource(planyoData, resourceId) {
-  const busy = [];
-  const rid = String(resourceId);
-
-  const usageByRid = planyoData?.data?.usage?.[rid];
-  if (usageByRid && typeof usageByRid === "object") {
-    for (const key of Object.keys(usageByRid)) {
-      const item = usageByRid[key];
-      const from = item?.from;
-      const to = item?.to;
-
-      if (isUnixSeconds(from) && isUnixSeconds(to)) {
-        busy.push({ start: unixSecondsToDateUTC(from), end: unixSecondsToDateUTC(to) });
-      }
-    }
-    return busy;
-  }
-
-  // Fallbacks (niet nodig in jouw case, maar safe)
-  const candidates = [
-    planyoData?.data?.periods,
-    planyoData?.periods,
-    planyoData?.data?.bookings,
-    planyoData?.bookings,
-    planyoData?.result?.periods,
-  ].find((arr) => Array.isArray(arr));
-
-  if (!candidates) return busy;
-
-  for (const item of candidates) {
-    const fromIso =
-      item?.from || item?.start || item?.date_from || item?.begin || item?.start_date;
-    const toIso = item?.to || item?.end || item?.date_to || item?.finish || item?.end_date;
-
-    if (isValidISODate(fromIso) && isValidISODate(toIso)) {
-      busy.push({ start: toDateUTC(fromIso), end: toDateUTC(toIso) });
-      continue;
-    }
-
-    const from = item?.from;
-    const to = item?.to;
-    if (isUnixSeconds(from) && isUnixSeconds(to)) {
-      busy.push({ start: unixSecondsToDateUTC(from), end: unixSecondsToDateUTC(to) });
-    }
-  }
-
-  return busy;
-}
-
-async function mapWithConcurrency(items, limit, fn) {
-  const results = [];
-  let i = 0;
-  const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
-    while (i < items.length) {
-      const idx = i++;
-      results[idx] = await fn(items[idx], idx);
-    }
-  });
-  await Promise.all(workers);
-  return results;
 }
 
 export default async function handler(req, res) {
@@ -178,110 +192,75 @@ export default async function handler(req, res) {
 
     if (!apiKey) return json(res, 500, { error: "Missing env var: PLANYO_API_KEY" });
 
-    const { start, end, resourceIds, debug } = req.query;
+    const { start, end, quantity, resourceIds, debug } = req.query;
     const debugMode = String(debug || "").toLowerCase() === "1";
 
     if (!isValidISODate(start) || !isValidISODate(end)) {
       return json(res, 400, { error: "Invalid or missing start/end. Use YYYY-MM-DD." });
     }
 
-    const startDate = toDateUTC(start);
-    const endDate = toDateUTC(end);
-    if (!(startDate < endDate)) {
-      return json(res, 400, { error: "Invalid range: start must be before end." });
+    const qty = Number(quantity || 1);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      return json(res, 400, { error: "Invalid quantity. Use a positive number." });
     }
 
     const ids = parseIds(resourceIds);
-    if (ids.length === 0) {
-      return json(res, 400, {
-        error: "Missing resourceIds. Provide comma-separated resource IDs from Webflow CMS.",
+
+    const planyoData = await callPlanyoResourceSearch({
+      baseUrl,
+      apiKey,
+      start,
+      end,
+      quantity: qty,
+      resourceIds: ids,
+      username,
+      password,
+    });
+
+    // Planyo error format (common): response_code + response_message
+    if (planyoData?.response_code && planyoData.response_code !== 0) {
+      return json(res, 200, {
+        start,
+        end,
+        quantity: qty,
+        availableResourceIds: [],
+        error: {
+          response_code: planyoData.response_code,
+          response_message: planyoData.response_message,
+        },
+        ...(debugMode
+          ? {
+              debug: {
+                topLevelKeys: safeKeys(planyoData),
+                rawPreview: makeRawPreview(planyoData),
+              },
+            }
+          : {}),
       });
     }
 
-    const checkRange = { start: startDate, end: endDate };
-    const CONCURRENCY = 6;
-
-    const errorsByResourceId = {};
-
-    const results = await mapWithConcurrency(ids, CONCURRENCY, async (id) => {
-      const planyoData = await callPlanyoGetResourceUsage({
-        baseUrl,
-        apiKey,
-        start,
-        end,
-        resourceId: id,
-        username,
-        password,
-      });
-
-      // ✅ Belangrijk: bij Planyo error -> markeer NIET als available
-      if (planyoData?.response_code && planyoData?.response_code !== 0) {
-        errorsByResourceId[String(id)] = {
-          response_code: planyoData.response_code,
-          response_message: planyoData.response_message,
-        };
-
-        if (!debugMode) return { id: String(id), isAvailable: false };
-
-        return {
-          id: String(id),
-          isAvailable: false,
-          debugInfo: {
-            error: {
-              response_code: planyoData.response_code,
-              response_message: planyoData.response_message,
-            },
-            topLevelKeys: safeKeys(planyoData),
-            rawPreview: makeRawPreview(planyoData),
-            busyCount: 0,
-          },
-        };
-      }
-
-      const busyRanges = extractBusyRangesForResource(planyoData, id);
-
-      let isAvailable = true;
-      for (const b of busyRanges) {
-        if (rangesOverlap(checkRange.start, checkRange.end, b.start, b.end)) {
-          isAvailable = false;
-          break;
-        }
-      }
-
-      if (!debugMode) return { id: String(id), isAvailable };
-
-      return {
-        id: String(id),
-        isAvailable,
-        debugInfo: {
-          topLevelKeys: safeKeys(planyoData),
-          dataKeys: safeKeys(planyoData?.data),
-          usageKeys: safeKeys(planyoData?.data?.usage),
-          busyCount: busyRanges.length,
-          busySample: busyRanges.slice(0, 5).map((r) => ({
-            start: r.start.toISOString(),
-            end: r.end.toISOString(),
-          })),
-          rawPreview: makeRawPreview(planyoData),
-        },
-      };
-    });
-
-    const availableResourceIds = results.filter((r) => r.isAvailable).map((r) => r.id);
-    const unavailableResourceIds = results.filter((r) => !r.isAvailable).map((r) => r.id);
+    const availableResourceIds = extractAvailableIds(planyoData);
 
     return json(res, 200, {
       start,
       end,
+      quantity: qty,
+      // Als je resourceIds meegaf, zijn dit de "available binnen die set".
+      // Als je niets meegaf, zijn dit alle available resources die Planyo teruggeeft.
       availableResourceIds,
-      unavailableResourceIds,
-      errorsByResourceId,
       meta: {
-        checked: ids.length,
-        concurrency: CONCURRENCY,
+        requestedFilterCount: ids.length,
+        returnedCount: availableResourceIds.length,
         debug: debugMode ? 1 : 0,
       },
-      ...(debugMode ? { debugResults: results } : {}),
+      ...(debugMode
+        ? {
+            debug: {
+              topLevelKeys: safeKeys(planyoData),
+              rawPreview: makeRawPreview(planyoData),
+            },
+          }
+        : {}),
     });
   } catch (err) {
     return json(res, 500, { error: err?.message || "Unknown error" });
