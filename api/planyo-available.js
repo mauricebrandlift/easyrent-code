@@ -1,5 +1,6 @@
 /**
  * Vercel Serverless Function (Node)
+ * File: /api/planyo-available.js
  * Endpoint: /api/planyo-available
  *
  * Query params:
@@ -14,11 +15,18 @@
  * - PLANYO_API_KEY
  * - PLANYO_API_USERNAME (optional)
  * - PLANYO_API_PASSWORD (optional)
+ *
+ * CORS:
+ * - Allows only:
+ *   - https://easyrentsuriname.nl
+ *   - https://www.easyrentsuriname.nl
+ *   - https://easyrent-suriname-2025.webflow.io
  */
 
 function json(res, status, data) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
+  // CDN caching on Vercel Edge (safe: response depends on query string)
   res.setHeader("Cache-Control", "s-maxage=60, stale-while-revalidate=300");
   res.end(JSON.stringify(data));
 }
@@ -88,6 +96,34 @@ function extractReasons(planyoData) {
   return out;
 }
 
+// --- CORS (allowlist: 2 domains) ---
+const ALLOWED_ORIGINS = new Set([
+  "https://easyrentsuriname.nl",
+  "https://www.easyrentsuriname.nl",
+  "https://easyrent-suriname-2025.webflow.io",
+]);
+
+function applyCors(req, res) {
+  const origin = req.headers.origin;
+
+  // If request has an Origin header, only allow if it's in the allowlist.
+  // (If no Origin header, we don't set ACAO — typical for server-to-server requests.)
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    // Prevent caches from mixing responses between origins
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    // optional: allow cookies (only if you ever use them). Not needed here.
+    // res.setHeader("Access-Control-Allow-Credentials", "true");
+    return true;
+  }
+
+  // If origin exists but isn't allowed, we still respond (with a clear error)
+  // and DO NOT set ACAO header -> browser will block.
+  return false;
+}
+
 async function callPlanyoResourceSearch({
   baseUrl,
   apiKey,
@@ -119,18 +155,44 @@ async function callPlanyoResourceSearch({
     throw new Error(`Planyo HTTP ${resp.status}. Body: ${text.slice(0, 300)}`);
   }
 
-  const data = await resp.json().catch(async () => {
-    const text = await resp.text();
-    throw new Error(`Planyo response not JSON. First 200 chars: ${text.slice(0, 200)}`);
-  });
+  // Note: only call resp.json once
+  const data = await resp.json().catch(() => null);
+  if (!data) {
+    throw new Error("Planyo response not valid JSON.");
+  }
 
   return data;
 }
 
 export default async function handler(req, res) {
+  // --- CORS first (and handle preflight) ---
+  const origin = req.headers.origin;
+  const isAllowedOrigin = origin ? ALLOWED_ORIGINS.has(origin) : false;
+
+  // If it's a browser preflight, we must answer OPTIONS properly
+  if (req.method === "OPTIONS") {
+    if (isAllowedOrigin) applyCors(req, res);
+    // If origin not allowed, still answer 204/200 without ACAO; browser will block.
+    res.statusCode = 204;
+    return res.end();
+  }
+
+  // For normal requests: set CORS headers only for allowed origins
+  if (isAllowedOrigin) applyCors(req, res);
+
+  // If request comes from a disallowed Origin, return a clear JSON error
+  // (browser will still block reading it, but it helps debugging via network logs)
+  if (origin && !isAllowedOrigin) {
+    return json(res, 403, {
+      error: "CORS: Origin not allowed",
+      origin,
+      allowedOrigins: Array.from(ALLOWED_ORIGINS),
+    });
+  }
+
   try {
     if (req.method !== "GET") {
-      res.setHeader("Allow", "GET");
+      res.setHeader("Allow", "GET, OPTIONS");
       return json(res, 405, { error: "Method not allowed" });
     }
 
@@ -168,7 +230,7 @@ export default async function handler(req, res) {
 
     const reasonsByResourceId = extractReasons(planyoData);
 
-    // Handle Planyo response_code (e.g. 4 = no results)
+    // Planyo response_code (e.g. 4 = no results)
     if (planyoData?.response_code && planyoData.response_code !== 0) {
       return json(res, 200, {
         start,
