@@ -21,6 +21,12 @@
  *   - https://easyrentsuriname.nl
  *   - https://www.easyrentsuriname.nl
  *   - https://easyrent-suriname-2025.webflow.io
+ *
+ * Lange periodes:
+ * - Planyo's resource_search past de online boekingsregel (max 90 dagen) toe.
+ * - Voor beschikbaarheid knippen we lange periodes op in gelijke, aansluitende
+ *   stukken onder die limiet. Een resource is beschikbaar als hij in ALLE
+ *   stukken vrij is.
  */
 
 function json(res, status, data) {
@@ -41,6 +47,31 @@ function parseIds(csv) {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+// --- Range opknippen (omzeilt Planyo's max-90-dagen boekingsregel) ---
+const MAX_CHUNK_DAYS = 85; // marge onder 90 i.v.m. inclusief tellen door Planyo
+
+function splitRange(startISO, endISO, maxDays = MAX_CHUNK_DAYS) {
+  const DAY = 86400000;
+  const s = Date.parse(`${startISO}T00:00:00Z`); // UTC, geen DST-gedoe
+  const e = Date.parse(`${endISO}T00:00:00Z`);
+  const total = Math.round((e - s) / DAY);
+  if (total <= maxDays) return [[startISO, endISO]];
+
+  // Gelijke stukken: voorkomt een mini-stuk aan het eind (min. verblijfsduur)
+  const n = Math.ceil(total / maxDays);
+  const size = Math.ceil(total / n);
+  const iso = (t) => new Date(t).toISOString().slice(0, 10);
+
+  const chunks = [];
+  for (let i = 0; i < n; i++) {
+    const cs = s + i * size * DAY;
+    const ce = Math.min(s + (i + 1) * size * DAY, e);
+    if (cs >= ce) break;
+    chunks.push([iso(cs), iso(ce)]); // aansluitend: einde = start volgende stuk
+  }
+  return chunks;
 }
 
 function safeKeys(obj) {
@@ -96,7 +127,7 @@ function extractReasons(planyoData) {
   return out;
 }
 
-// --- CORS (allowlist: 2 domains) ---
+// --- CORS (allowlist) ---
 const ALLOWED_ORIGINS = new Set([
   "https://easyrentsuriname.nl",
   "https://www.easyrentsuriname.nl",
@@ -114,8 +145,6 @@ function applyCors(req, res) {
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-    // optional: allow cookies (only if you ever use them). Not needed here.
-    // res.setHeader("Access-Control-Allow-Credentials", "true");
     return true;
   }
 
@@ -169,10 +198,9 @@ export default async function handler(req, res) {
   const origin = req.headers.origin;
   const isAllowedOrigin = origin ? ALLOWED_ORIGINS.has(origin) : false;
 
-  // If it's a browser preflight, we must answer OPTIONS properly
+  // Browser preflight
   if (req.method === "OPTIONS") {
     if (isAllowedOrigin) applyCors(req, res);
-    // If origin not allowed, still answer 204/200 without ACAO; browser will block.
     res.statusCode = 204;
     return res.end();
   }
@@ -180,8 +208,7 @@ export default async function handler(req, res) {
   // For normal requests: set CORS headers only for allowed origins
   if (isAllowedOrigin) applyCors(req, res);
 
-  // If request comes from a disallowed Origin, return a clear JSON error
-  // (browser will still block reading it, but it helps debugging via network logs)
+  // Disallowed Origin → clear JSON error (browser blocks reading it anyway)
   if (origin && !isAllowedOrigin) {
     return json(res, 403, {
       error: "CORS: Origin not allowed",
@@ -210,57 +237,78 @@ export default async function handler(req, res) {
       return json(res, 400, { error: "Invalid or missing start/end. Use YYYY-MM-DD." });
     }
 
+    if (!(Date.parse(`${start}T00:00:00Z`) < Date.parse(`${end}T00:00:00Z`))) {
+      return json(res, 400, { error: "Invalid range: start must be before end." });
+    }
+
     const qty = Number(quantity || 1);
     if (!Number.isFinite(qty) || qty <= 0) {
       return json(res, 400, { error: "Invalid quantity. Use a positive number." });
     }
 
     const idsFilter = parseIds(resourceIds);
+    const chunks = splitRange(start, end);
 
-    const planyoData = await callPlanyoResourceSearch({
-      baseUrl,
-      apiKey,
-      start,
-      end,
-      quantity: qty,
-      resourceIds: idsFilter,
-      username,
-      password,
-    });
+    // Per stuk een resource_search, parallel
+    const chunkResults = await Promise.all(
+      chunks.map(([cs, ce]) =>
+        callPlanyoResourceSearch({
+          baseUrl,
+          apiKey,
+          start: cs,
+          end: ce,
+          quantity: qty,
+          resourceIds: idsFilter,
+          username,
+          password,
+        })
+      )
+    );
 
-    const reasonsByResourceId = extractReasons(planyoData);
+    let availableSet = null;
+    const allReasons = {};
+    const chunkErrors = [];
 
-    // Planyo response_code (e.g. 4 = no results)
-    if (planyoData?.response_code && planyoData.response_code !== 0) {
-      return json(res, 200, {
-        start,
-        end,
-        quantity: qty,
-        availableResourceIds: [],
-        unavailableResourceIds: idsFilter.length ? idsFilter.map(String) : [],
-        reasonsByResourceId,
-        error: {
+    chunkResults.forEach((planyoData, i) => {
+      const [cs, ce] = chunks[i];
+
+      // response_code 4 = geen resultaten in dit stuk → niets beschikbaar
+      const hasError = planyoData?.response_code && planyoData.response_code !== 0;
+      if (hasError) {
+        chunkErrors.push({
+          start: cs,
+          end: ce,
           response_code: planyoData.response_code,
           response_message: planyoData.response_message,
-        },
-        meta: {
-          requestedFilterCount: idsFilter.length,
-          returnedCount: 0,
-          reasonsCount: Object.keys(reasonsByResourceId).length,
-          debug: debugMode ? 1 : 0,
-        },
-        ...(debugMode
-          ? { debug: { topLevelKeys: safeKeys(planyoData), rawPreview: makeRawPreview(planyoData) } }
-          : {}),
-      });
-    }
+        });
+      }
 
-    const availableResourceIds = extractAvailableIdsStrict(planyoData);
+      const ids = hasError ? [] : extractAvailableIdsStrict(planyoData).map(String);
+
+      // Eerste reden per resource bewaren, met het stuk erbij voor debugging
+      for (const [rid, msg] of Object.entries(extractReasons(planyoData))) {
+        if (!allReasons[rid]) allReasons[rid] = `${cs} → ${ce}: ${msg}`;
+      }
+
+      // Doorsnede over alle stukken
+      availableSet =
+        availableSet === null
+          ? new Set(ids)
+          : new Set(ids.filter((id) => availableSet.has(id)));
+    });
+
+    const availableResourceIds = Array.from(availableSet || []);
 
     let unavailableResourceIds = [];
     if (idsFilter.length) {
-      const availSet = new Set(availableResourceIds.map(String));
+      const availSet = new Set(availableResourceIds);
       unavailableResourceIds = idsFilter.map(String).filter((id) => !availSet.has(id));
+    }
+
+    // Alleen redenen tonen voor resources die uiteindelijk onbeschikbaar zijn
+    const reasonsByResourceId = {};
+    for (const rid of unavailableResourceIds) {
+      if (allReasons[rid]) reasonsByResourceId[rid] = allReasons[rid];
     }
 
     return json(res, 200, {
@@ -274,10 +322,18 @@ export default async function handler(req, res) {
         requestedFilterCount: idsFilter.length,
         returnedCount: availableResourceIds.length,
         reasonsCount: Object.keys(reasonsByResourceId).length,
+        chunks,
+        chunkErrors,
         debug: debugMode ? 1 : 0,
       },
       ...(debugMode
-        ? { debug: { topLevelKeys: safeKeys(planyoData), rawPreview: makeRawPreview(planyoData) } }
+        ? {
+            debug: chunkResults.map((d, i) => ({
+              chunk: chunks[i],
+              topLevelKeys: safeKeys(d),
+              rawPreview: makeRawPreview(d),
+            })),
+          }
         : {}),
     });
   } catch (err) {
